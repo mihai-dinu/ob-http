@@ -1,3 +1,4 @@
+;;; -*- lexical-binding: t -*-
 ;;; ob-http.el --- http request in org-mode babel
 
 ;; Copyright (C) 2015 Feng Zhou
@@ -169,6 +170,33 @@
   (s-format body 'ob-http-aget
             (mapcar (lambda (x) (when (eq (car x) :var) (cdr x))) params)))
 
+(defun ob-http-expand-auth-variables (params)
+  "Expand :username and :password values by looking them up in :var entries."
+  (let ((username-key (cdr (assoc :username params)))
+        (password-key (cdr (assoc :password params))))
+    (mapcar (lambda (param)
+              (cond
+               ((eq (car param) :username)
+                (cons :username (ob-http-get-var-value username-key params)))
+               ((eq (car param) :password)
+                (cons :password (ob-http-get-var-value password-key params)))
+               (t param)))
+            params)))
+
+(defun ob-http-get-var-value (var-name params)
+  "Get the value of VAR-NAME from :var entries in PARAMS."
+  (if (stringp var-name)
+      (let* ((var-symbol (intern var-name))
+             (var-entry (cl-find-if
+                         (lambda (x)
+                           (and (eq (car x) :var)
+                                (eq (cadr x) var-symbol)))
+                         params)))
+        (if var-entry
+            (cddr var-entry)
+          var-name))
+    var-name))
+
 (defun ob-http-get-response-header (response header)
   (cdr (assoc (s-downcase header) (ob-http-response-headers-map response))))
 
@@ -204,7 +232,9 @@
       (insert body))))
 
 (defun org-babel-execute:http (body params)
-  (let* ((request (ob-http-parse-request (org-babel-expand-body:http body params)))
+  (let* ((params (ob-http-expand-auth-variables params))
+         (request (ob-http-parse-request (org-babel-expand-body:http body params)))
+         (print-curl (assoc :print-curl params))
          (proxy (cdr (assoc :proxy params)))
          (noproxy (assoc :noproxy params))
          (follow-redirect (and (assoc :follow-redirect params) (not (string= "no" (cdr (assoc :follow-redirect params))))))
@@ -219,7 +249,7 @@
          (resolve (cdr (assoc :resolve params)))
          (request-body (ob-http-request-body request))
          (error-output (org-babel-temp-file "curl-error"))
-         (args (append ob-http:curl-custom-arguments (list "-i"
+         (args-no-body (append ob-http:curl-custom-arguments (list "-i"
                      (when (and proxy (not noproxy)) `("-x" ,proxy))
                      (when noproxy '("--noproxy" "*"))
                      (let ((method (ob-http-request-method request)))
@@ -229,10 +259,6 @@
                        `("--user" ,(s-format "${:username}:${:password}" 'ob-http-aget params)))
                      (when (assoc :user params) `("--user" ,(cdr (assoc :user params))))
                      (mapcar (lambda (x) `("-H" ,x)) (ob-http-request-headers request))
-                     (when (s-present? request-body)
-                       (let ((tmp (org-babel-temp-file "http-")))
-                         (with-temp-file tmp (insert request-body))
-                         `("-d" ,(format "@%s" tmp))))
                      (when cookie-jar `("--cookie-jar" ,cookie-jar))
                      (when cookie `("--cookie" ,cookie))
                      (when resolve (mapcar (lambda (x) `("--resolve" ,x)) (split-string resolve ",")))
@@ -241,28 +267,46 @@
                      (int-to-string (or (cdr (assoc :max-time params))
                                         ob-http:max-time))
                      "--globoff"
-                     (ob-http-construct-url (ob-http-request-url request) params)))))
-    (with-current-buffer (get-buffer-create "*curl commands history*")
-      (goto-char (point-max))
-      (insert "curl "
-              (string-join (mapcar 'shell-quote-argument (ob-http-flatten args)) " ")
-              "\n"))
-    (with-current-buffer (get-buffer-create "*curl output*")
-      (erase-buffer)
-      (if (= 0 (apply 'call-process "curl" nil `(t ,error-output) nil (ob-http-flatten args)))
-          (let ((response (ob-http-parse-response (buffer-string))))
-            (when prettify (ob-http-pretty-response response (cdr pretty)))
-            (when ob-http:remove-cr (ob-http-remove-carriage-return response))
-            (cond (get-header (ob-http-get-response-header response get-header))
-                  (select (ob-http-select response select))
-                  (prettify (ob-http-response-body response))
-                  (file (ob-http-file response (cdr file)))
-                  (t (s-join "\n\n" (list (ob-http-response-headers response) (ob-http-response-body response))))))
-        (with-output-to-temp-buffer "*curl error*"
-          (princ (with-temp-buffer
-                   (insert-file-contents-literally error-output)
-                   (s-join "\n" (s-lines (buffer-string)))))
-          "")))))
+                     (ob-http-construct-url (ob-http-request-url request) params))))
+
+         (args (append args-no-body
+                       (when (s-present? request-body)
+                         (let ((tmp (org-babel-temp-file "http-")))
+                           (with-temp-file tmp (insert request-body))
+                           `("-d" ,(format "@%s" tmp)))))))
+
+      (with-current-buffer (get-buffer-create "*curl commands history*")
+        (goto-char (point-max))
+        (insert "curl "
+                (string-join (mapcar 'shell-quote-argument (ob-http-flatten args)) " ")
+                "\n"))
+      (with-current-buffer (get-buffer-create "*curl output*")
+        (erase-buffer)
+        (if (= 0 (apply 'call-process "curl" nil `(t ,error-output) nil (ob-http-flatten args)))
+            (let ((response (ob-http-parse-response (buffer-string))))
+              (when prettify (ob-http-pretty-response response (cdr pretty)))
+              (when ob-http:remove-cr (ob-http-remove-carriage-return response))
+              (let ((cmd-with-response (list (when print-curl
+                                         (let* ((trimmed-body (when (s-present? request-body)
+                                                                (replace-regexp-in-string " " "" request-body)))
+                                                (quoted-args (mapcar 'shell-quote-argument (ob-http-flatten args-no-body)))
+                                                (curl-cmd (concat "curl "
+                                                                  (string-join quoted-args " ")
+                                                                  (when (s-present? trimmed-body)
+                                                                    (concat " -d '" trimmed-body "'")))))
+                                           ;; Return the curl command as a single line
+                                           (replace-regexp-in-string "\n" " " curl-cmd)))
+                                       (cond (get-header (ob-http-get-response-header response get-header))
+                                             (select (ob-http-select response select))
+                                             (prettify (ob-http-response-body response))
+                                             (file (ob-http-file response (cdr file)))
+                                             (t (s-join "\n\n" (list (ob-http-response-headers response) (ob-http-response-body response))))))))
+                (s-join "\n\n" (delq nil cmd-with-response))))
+          (with-output-to-temp-buffer "*curl error*"
+            (princ (with-temp-buffer
+                     (insert-file-contents-literally error-output)
+                     (s-join "\n" (s-lines (buffer-string)))))
+            "")))))
 
 (defun ob-http-export-expand-variables (&optional backend)
   "Scan current buffer for all HTTP source code blocks and expand variables.
